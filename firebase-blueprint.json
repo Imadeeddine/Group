@@ -1,0 +1,23 @@
+{
+  "entities": {
+    "Subject": {
+      "title": "Subject",
+      "description": "A study subject containing project groups and enrolled students",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "professorName": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "groups": { "type": "array" }
+      },
+      "required": ["id", "name"]
+    }
+  },
+  "firestore": {
+    "/subjects/{subjectId}": {
+      "schema": "Subject",
+      "description": "Collection of subjects with groups and student rosters"
+    }
+  }
+}

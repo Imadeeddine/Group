@@ -1,4 +1,12 @@
 import React, { useState, useEffect } from 'react';
+import { db } from './firebase';
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  deleteDoc, 
+  onSnapshot 
+} from 'firebase/firestore';
 import { 
   Users, 
   Plus, 
@@ -14,7 +22,6 @@ import {
   X,
   Edit2,
   MessageCircle,
-  RotateCcw,
   UserCheck,
   Layers,
   ChevronRight,
@@ -27,7 +34,9 @@ import {
   Send,
   FileText,
   Printer,
-  Download
+  Download,
+  Cloud,
+  CloudCheck
 } from 'lucide-react';
 
 interface Group {
@@ -145,8 +154,49 @@ export default function App() {
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
   const [deletePasscode, setDeletePasscode] = useState<string>('');
   const [passcodeError, setPasscodeError] = useState<string | null>(null);
+  const [isCloudSynced, setIsCloudSynced] = useState<boolean>(true);
 
-  // Save to local storage
+  // Real-time Firestore synchronization across all devices
+  useEffect(() => {
+    try {
+      const subjectsCol = collection(db, 'subjects');
+      const unsubscribe = onSnapshot(subjectsCol, (snapshot) => {
+        const cloudSubjects: Subject[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data();
+          cloudSubjects.push({
+            id: docSnap.id,
+            name: data.name || '',
+            professorName: data.professorName || 'أستاذ المادة',
+            createdAt: data.createdAt || Date.now(),
+            groups: Array.isArray(data.groups) ? data.groups : []
+          });
+        });
+
+        cloudSubjects.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        if (cloudSubjects.length > 0) {
+          setSubjects(cloudSubjects);
+        } else if (snapshot.empty && subjects.length > 0) {
+          // Initialize first subject in Firestore
+          subjects.forEach((s) => {
+            setDoc(doc(db, 'subjects', s.id), s).catch(console.error);
+          });
+        }
+        setIsCloudSynced(true);
+      }, (error) => {
+        console.error('Firestore snapshot sync error:', error);
+        setIsCloudSynced(false);
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error('Firestore initialization error:', e);
+      setIsCloudSynced(false);
+    }
+  }, []);
+
+  // Save to local storage as offline cache
   useEffect(() => {
     try {
       localStorage.setItem('app_subjects_data', JSON.stringify(subjects));
@@ -155,6 +205,25 @@ export default function App() {
       console.error(e);
     }
   }, [subjects, activities]);
+
+  // Firestore sync helper
+  const syncSubjectDoc = async (subject: Subject) => {
+    try {
+      await setDoc(doc(db, 'subjects', subject.id), subject);
+      setIsCloudSynced(true);
+    } catch (err) {
+      console.error('Failed to sync subject to Firestore:', err);
+    }
+  };
+
+  const removeSubjectDoc = async (subjectId: string) => {
+    try {
+      await deleteDoc(doc(db, 'subjects', subjectId));
+      setIsCloudSynced(true);
+    } catch (err) {
+      console.error('Failed to delete subject from Firestore:', err);
+    }
+  };
 
   const showToast = (msg: string) => {
     setNotificationMsg(msg);
@@ -170,13 +239,13 @@ export default function App() {
   };
 
   // Add a new subject
-  const handleAddSubject = (e?: React.FormEvent) => {
+  const handleAddSubject = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const name = newSubjectName.trim();
     if (!name) return;
 
     const newSubject: Subject = {
-      id: Date.now().toString(),
+      id: 'sub_' + Date.now().toString(),
       name,
       professorName: newProfessorName.trim() || 'أستاذ المادة',
       createdAt: Date.now(),
@@ -190,13 +259,16 @@ export default function App() {
     addLog(`تمت إضافة مادة جديدة: "${name}" (${newSubject.professorName})`);
     showToast(`تمت إضافة مادة "${name}" بنجاح! 📚`);
 
+    // Persist to Cloud Firestore
+    syncSubjectDoc(newSubject);
+
     // Auto open newly added subject
     setSelectedSubjectId(newSubject.id);
     setActiveTab('groups');
   };
 
   // Add a new group inside current subject
-  const handleAddGroup = () => {
+  const handleAddGroup = async () => {
     if (!selectedSubjectId) return;
 
     const currentSubject = subjects.find(s => s.id === selectedSubjectId);
@@ -205,49 +277,52 @@ export default function App() {
     const newGroupNum = currentSubject.groups.length + 1;
     const newGroupName = `المجموعة ${newGroupNum}`;
     const newGroup: Group = {
-      id: Date.now().toString(),
+      id: 'grp_' + Date.now().toString(),
       name: newGroupName,
       createdAt: Date.now(),
       members: []
     };
 
-    setSubjects(prev => prev.map(s => {
-      if (s.id === selectedSubjectId) {
-        return {
-          ...s,
-          groups: [newGroup, ...s.groups]
-        };
-      }
-      return s;
-    }));
+    const updatedSubject: Subject = {
+      ...currentSubject,
+      groups: [newGroup, ...currentSubject.groups]
+    };
+
+    setSubjects(prev => prev.map(s => (s.id === selectedSubjectId ? updatedSubject : s)));
+    syncSubjectDoc(updatedSubject);
 
     addLog(`تمت إضافة ${newGroupName} في مادة ${currentSubject.name}`);
     showToast(`تمت إضافة ${newGroupName} بنجاح!`);
   };
 
   // Add student / member to group
-  const handleAddMember = (groupId: string) => {
+  const handleAddMember = async (groupId: string) => {
     if (!selectedSubjectId) return;
     const name = memberInputs[groupId]?.trim();
     if (!name) return;
 
+    const currentSubject = subjects.find(s => s.id === selectedSubjectId);
+    if (!currentSubject) return;
+
     let targetGroupName = '';
-    setSubjects(prev => prev.map(s => {
-      if (s.id === selectedSubjectId) {
-        const updatedGroups = s.groups.map(group => {
-          if (group.id === groupId) {
-            targetGroupName = group.name;
-            return {
-              ...group,
-              members: [...group.members, name]
-            };
-          }
-          return group;
-        });
-        return { ...s, groups: updatedGroups };
+    const updatedGroups = currentSubject.groups.map(group => {
+      if (group.id === groupId) {
+        targetGroupName = group.name;
+        return {
+          ...group,
+          members: [...group.members, name]
+        };
       }
-      return s;
-    }));
+      return group;
+    });
+
+    const updatedSubject: Subject = {
+      ...currentSubject,
+      groups: updatedGroups
+    };
+
+    setSubjects(prev => prev.map(s => (s.id === selectedSubjectId ? updatedSubject : s)));
+    syncSubjectDoc(updatedSubject);
 
     addLog(`انضم الطالب "${name}" إلى ${targetGroupName}`);
     setMemberInputs(prev => ({ ...prev, [groupId]: '' }));
@@ -255,21 +330,27 @@ export default function App() {
   };
 
   // Rename group
-  const handleSaveRename = (groupId: string) => {
+  const handleSaveRename = async (groupId: string) => {
     if (!selectedSubjectId || !editingGroupName.trim()) {
       setEditingGroupId(null);
       return;
     }
-    setSubjects(prev => prev.map(s => {
-      if (s.id === selectedSubjectId) {
-        const updated = s.groups.map(g => {
-          if (g.id === groupId) return { ...g, name: editingGroupName.trim() };
-          return g;
-        });
-        return { ...s, groups: updated };
-      }
-      return s;
-    }));
+    const currentSubject = subjects.find(s => s.id === selectedSubjectId);
+    if (!currentSubject) return;
+
+    const updatedGroups = currentSubject.groups.map(g => {
+      if (g.id === groupId) return { ...g, name: editingGroupName.trim() };
+      return g;
+    });
+
+    const updatedSubject: Subject = {
+      ...currentSubject,
+      groups: updatedGroups
+    };
+
+    setSubjects(prev => prev.map(s => (s.id === selectedSubjectId ? updatedSubject : s)));
+    syncSubjectDoc(updatedSubject);
+
     setEditingGroupId(null);
     showToast('تم تعديل اسم المجموعة');
   };
@@ -310,7 +391,7 @@ export default function App() {
   };
 
   // Confirm delete with passcode 'imad'
-  const handleConfirmDelete = (e: React.FormEvent) => {
+  const handleConfirmDelete = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!pendingDelete) return;
 
@@ -322,6 +403,8 @@ export default function App() {
     // Code is 'imad' -> perform requested delete
     if (pendingDelete.type === 'subject') {
       setSubjects(prev => prev.filter(s => s.id !== pendingDelete.subjectId));
+      removeSubjectDoc(pendingDelete.subjectId);
+
       if (selectedSubjectId === pendingDelete.subjectId) {
         setSelectedSubjectId(null);
         setActiveTab('home');
@@ -329,33 +412,36 @@ export default function App() {
       addLog(`تم حذف المادة "${pendingDelete.subjectName}"`);
       showToast(`تم حذف المادة "${pendingDelete.subjectName}" بنجاح 🗑️`);
     } else if (pendingDelete.type === 'group' && pendingDelete.groupId) {
-      setSubjects(prev => prev.map(s => {
-        if (s.id === pendingDelete.subjectId) {
-          return {
-            ...s,
-            groups: s.groups.filter(g => g.id !== pendingDelete.groupId)
-          };
-        }
-        return s;
-      }));
+      const currentSub = subjects.find(s => s.id === pendingDelete.subjectId);
+      if (currentSub) {
+        const updatedSub: Subject = {
+          ...currentSub,
+          groups: currentSub.groups.filter(g => g.id !== pendingDelete.groupId)
+        };
+        setSubjects(prev => prev.map(s => (s.id === pendingDelete.subjectId ? updatedSub : s)));
+        syncSubjectDoc(updatedSub);
+      }
       addLog(`تم حذف ${pendingDelete.groupName}`);
       showToast(`تم حذف ${pendingDelete.groupName} بنجاح 🗑️`);
     } else if (pendingDelete.type === 'member' && pendingDelete.groupId && typeof pendingDelete.memberIndex === 'number') {
       const idx = pendingDelete.memberIndex;
-      setSubjects(prev => prev.map(s => {
-        if (s.id === pendingDelete.subjectId) {
-          const updatedGroups = s.groups.map(g => {
-            if (g.id === pendingDelete.groupId) {
-              const updatedMembers = [...g.members];
-              updatedMembers.splice(idx, 1);
-              return { ...g, members: updatedMembers };
-            }
-            return g;
-          });
-          return { ...s, groups: updatedGroups };
-        }
-        return s;
-      }));
+      const currentSub = subjects.find(s => s.id === pendingDelete.subjectId);
+      if (currentSub) {
+        const updatedGroups = currentSub.groups.map(g => {
+          if (g.id === pendingDelete.groupId) {
+            const updatedMembers = [...g.members];
+            updatedMembers.splice(idx, 1);
+            return { ...g, members: updatedMembers };
+          }
+          return g;
+        });
+        const updatedSub: Subject = {
+          ...currentSub,
+          groups: updatedGroups
+        };
+        setSubjects(prev => prev.map(s => (s.id === pendingDelete.subjectId ? updatedSub : s)));
+        syncSubjectDoc(updatedSub);
+      }
       addLog(`تم حذف الطالب "${pendingDelete.memberName}" من ${pendingDelete.groupName}`);
       showToast(`تم حذف الطالب "${pendingDelete.memberName}" بنجاح 🗑️`);
     }
@@ -526,7 +612,13 @@ export default function App() {
               <GraduationCap className="w-5 h-5 text-white" />
             </div>
             <div>
-              <h1 className="font-extrabold text-lg tracking-tight">تسجيل مجموعات المشاريع</h1>
+              <div className="flex items-center gap-1.5">
+                <h1 className="font-extrabold text-lg tracking-tight">تسجيل مجموعات المشاريع</h1>
+                <span className="flex items-center gap-1 bg-emerald-500/25 border border-emerald-400/40 text-emerald-200 text-[10px] px-2 py-0.5 rounded-full font-bold">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span>مباشر</span>
+                </span>
+              </div>
               <p className="text-[11px] text-purple-200">
                 {currentSubject ? `المادة: ${currentSubject.name}` : `${subjects.length} مواد • ${totalStudents} طالب مسجل`}
               </p>
