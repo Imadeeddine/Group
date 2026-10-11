@@ -1,0 +1,7 @@
+{
+  "name": "تطبيق المجموعات - إدارة الأعضاء",
+  "description": "تطبيق بسيط لإضافة المجموعات وتسجيل أسماء الأعضاء بكل سهولة وسرعة",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
