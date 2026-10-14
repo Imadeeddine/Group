@@ -5,7 +5,8 @@ import {
   doc, 
   setDoc, 
   deleteDoc, 
-  onSnapshot 
+  onSnapshot,
+  runTransaction 
 } from 'firebase/firestore';
 import { 
   Users, 
@@ -36,8 +37,11 @@ import {
   Printer,
   Download,
   Cloud,
-  CloudCheck
+  CloudCheck,
+  Loader2
 } from 'lucide-react';
+// @ts-ignore
+import html2pdf from 'html2pdf.js';
 
 interface Group {
   id: string;
@@ -124,6 +128,7 @@ export default function App() {
 
   // PDF Preview and Download Modal
   const [pdfSubject, setPdfSubject] = useState<Subject | null>(null);
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState<boolean>(false);
 
   // Logs
   const [activities, setActivities] = useState<ActivityLog[]>(() => {
@@ -155,12 +160,17 @@ export default function App() {
   const [deletePasscode, setDeletePasscode] = useState<string>('');
   const [passcodeError, setPasscodeError] = useState<string | null>(null);
   const [isCloudSynced, setIsCloudSynced] = useState<boolean>(true);
+  const [hasPendingWrites, setHasPendingWrites] = useState<boolean>(false);
+  
+  // Optimistic UI state: immediate rendering of registering students before network roundtrip
+  const [savingGroup, setSavingGroup] = useState<Record<string, boolean>>({});
+  const [pendingMembers, setPendingMembers] = useState<Record<string, string[]>>({});
 
-  // Real-time Firestore synchronization across all devices
+  // Real-time Firestore synchronization across all devices with metadata tracking
   useEffect(() => {
     try {
       const subjectsCol = collection(db, 'subjects');
-      const unsubscribe = onSnapshot(subjectsCol, (snapshot) => {
+      const unsubscribe = onSnapshot(subjectsCol, { includeMetadataChanges: true }, (snapshot) => {
         const cloudSubjects: Subject[] = [];
         snapshot.forEach((docSnap) => {
           const data = docSnap.data();
@@ -175,15 +185,34 @@ export default function App() {
 
         cloudSubjects.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
+        // Preserve and display whatever is in Firestore without wiping
         if (cloudSubjects.length > 0) {
           setSubjects(cloudSubjects);
-        } else if (snapshot.empty && subjects.length > 0) {
-          // Initialize first subject in Firestore
-          subjects.forEach((s) => {
-            setDoc(doc(db, 'subjects', s.id), s).catch(console.error);
-          });
         }
         setIsCloudSynced(true);
+        setHasPendingWrites(snapshot.metadata.hasPendingWrites);
+
+        // Auto-cleanup any pending members that now exist in the confirmed cloud data
+        setPendingMembers(prev => {
+          let hasChanges = false;
+          const next = { ...prev };
+          cloudSubjects.forEach(s => {
+            s.groups.forEach(g => {
+              if (next[g.id] && next[g.id].length > 0) {
+                const filtered = next[g.id].filter(name => !g.members.includes(name));
+                if (filtered.length !== next[g.id].length) {
+                  hasChanges = true;
+                  if (filtered.length === 0) {
+                    delete next[g.id];
+                  } else {
+                    next[g.id] = filtered;
+                  }
+                }
+              }
+            });
+          });
+          return hasChanges ? next : prev;
+        });
       }, (error) => {
         console.error('Firestore snapshot sync error:', error);
         setIsCloudSynced(false);
@@ -196,7 +225,7 @@ export default function App() {
     }
   }, []);
 
-  // Save to local storage as offline cache
+  // Save to local storage as offline cache only
   useEffect(() => {
     try {
       localStorage.setItem('app_subjects_data', JSON.stringify(subjects));
@@ -205,25 +234,6 @@ export default function App() {
       console.error(e);
     }
   }, [subjects, activities]);
-
-  // Firestore sync helper
-  const syncSubjectDoc = async (subject: Subject) => {
-    try {
-      await setDoc(doc(db, 'subjects', subject.id), subject);
-      setIsCloudSynced(true);
-    } catch (err) {
-      console.error('Failed to sync subject to Firestore:', err);
-    }
-  };
-
-  const removeSubjectDoc = async (subjectId: string) => {
-    try {
-      await deleteDoc(doc(db, 'subjects', subjectId));
-      setIsCloudSynced(true);
-    } catch (err) {
-      console.error('Failed to delete subject from Firestore:', err);
-    }
-  };
 
   const showToast = (msg: string) => {
     setNotificationMsg(msg);
@@ -238,7 +248,7 @@ export default function App() {
     setActivities(prev => [{ id: Date.now().toString(), text, time: timeStr }, ...prev.slice(0, 19)]);
   };
 
-  // Add a new subject
+  // Add a new subject atomically
   const handleAddSubject = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const name = newSubjectName.trim();
@@ -252,107 +262,184 @@ export default function App() {
       groups: []
     };
 
-    setSubjects(prev => [newSubject, ...prev]);
     setNewSubjectName('');
     setNewProfessorName('');
     setShowAddSubjectForm(false);
-    addLog(`تمت إضافة مادة جديدة: "${name}" (${newSubject.professorName})`);
-    showToast(`تمت إضافة مادة "${name}" بنجاح! 📚`);
 
-    // Persist to Cloud Firestore
-    syncSubjectDoc(newSubject);
-
-    // Auto open newly added subject
-    setSelectedSubjectId(newSubject.id);
-    setActiveTab('groups');
+    try {
+      await setDoc(doc(db, 'subjects', newSubject.id), newSubject);
+      addLog(`تمت إضافة مادة جديدة: "${name}" (${newSubject.professorName})`);
+      showToast(`تمت إضافة مادة "${name}" بنجاح! 📚`);
+      setSelectedSubjectId(newSubject.id);
+      setActiveTab('groups');
+    } catch (err) {
+      console.error('Error creating subject in Firestore:', err);
+      showToast('حدث خطأ أثناء حفظ المادة في السحابة');
+    }
   };
 
-  // Add a new group inside current subject
+  // Add a new group inside current subject using Firestore Transaction (Concurrency Safe)
   const handleAddGroup = async () => {
     if (!selectedSubjectId) return;
 
-    const currentSubject = subjects.find(s => s.id === selectedSubjectId);
-    if (!currentSubject) return;
+    try {
+      const subjectDocRef = doc(db, 'subjects', selectedSubjectId);
+      let newGroupName = '';
 
-    const newGroupNum = currentSubject.groups.length + 1;
-    const newGroupName = `المجموعة ${newGroupNum}`;
-    const newGroup: Group = {
-      id: 'grp_' + Date.now().toString(),
-      name: newGroupName,
-      createdAt: Date.now(),
-      members: []
-    };
+      await runTransaction(db, async (transaction) => {
+        const subDoc = await transaction.get(subjectDocRef);
+        if (!subDoc.exists()) {
+          throw new Error('المادة غير موجودة في قاعدة البيانات');
+        }
 
-    const updatedSubject: Subject = {
-      ...currentSubject,
-      groups: [newGroup, ...currentSubject.groups]
-    };
+        const data = subDoc.data();
+        const cloudGroups: Group[] = Array.isArray(data.groups) ? data.groups : [];
+        const newGroupNum = cloudGroups.length + 1;
+        newGroupName = `المجموعة ${newGroupNum}`;
 
-    setSubjects(prev => prev.map(s => (s.id === selectedSubjectId ? updatedSubject : s)));
-    syncSubjectDoc(updatedSubject);
+        const newGroup: Group = {
+          id: 'grp_' + Date.now().toString() + '_' + Math.random().toString(36).slice(2, 6),
+          name: newGroupName,
+          createdAt: Date.now(),
+          members: []
+        };
 
-    addLog(`تمت إضافة ${newGroupName} في مادة ${currentSubject.name}`);
-    showToast(`تمت إضافة ${newGroupName} بنجاح!`);
+        const updatedGroups = [newGroup, ...cloudGroups];
+        transaction.update(subjectDocRef, { groups: updatedGroups });
+      });
+
+      addLog(`تمت إضافة ${newGroupName}`);
+      showToast(`تمت إضافة ${newGroupName} بنجاح!`);
+    } catch (err) {
+      console.error('Error adding group in transaction:', err);
+      showToast('حدث خطأ أثناء إضافة المجموعة، يرجى إعادة المحاولة');
+    }
   };
 
-  // Add student / member to group
+  // Add student / member to group with Optimistic UI + Concurrency Safe Firestore Transaction
   const handleAddMember = async (groupId: string) => {
     if (!selectedSubjectId) return;
-    const name = memberInputs[groupId]?.trim();
-    if (!name) return;
+    const cleanName = memberInputs[groupId]?.trim();
+    if (!cleanName) return;
 
-    const currentSubject = subjects.find(s => s.id === selectedSubjectId);
-    if (!currentSubject) return;
+    // Prevent double clicking / concurrent submission on same group
+    if (savingGroup[groupId]) return;
 
-    let targetGroupName = '';
-    const updatedGroups = currentSubject.groups.map(group => {
-      if (group.id === groupId) {
-        targetGroupName = group.name;
-        return {
-          ...group,
-          members: [...group.members, name]
-        };
-      }
-      return group;
-    });
+    // Check if student already in the group locally
+    const targetGroup = currentSubject?.groups.find(g => g.id === groupId);
+    const existingMembers = targetGroup?.members || [];
+    const existingPending = pendingMembers[groupId] || [];
+    if (existingMembers.includes(cleanName) || existingPending.includes(cleanName)) {
+      showToast(`الطالب "${cleanName}" مسجل بالفعل في هذه المجموعة!`);
+      return;
+    }
 
-    const updatedSubject: Subject = {
-      ...currentSubject,
-      groups: updatedGroups
-    };
-
-    setSubjects(prev => prev.map(s => (s.id === selectedSubjectId ? updatedSubject : s)));
-    syncSubjectDoc(updatedSubject);
-
-    addLog(`انضم الطالب "${name}" إلى ${targetGroupName}`);
+    // 1. Optimistic UI update:
+    // Add student immediately to local pending state so they appear instantly on screen
+    setPendingMembers(prev => ({
+      ...prev,
+      [groupId]: [...(prev[groupId] || []), cleanName]
+    }));
+    // Clear input field immediately
     setMemberInputs(prev => ({ ...prev, [groupId]: '' }));
-    showToast(`تم تسجيل الطالب "${name}" بنجاح!`);
+    // Set saving state to disable submit button and show spinner
+    setSavingGroup(prev => ({ ...prev, [groupId]: true }));
+
+    try {
+      const subjectDocRef = doc(db, 'subjects', selectedSubjectId);
+      let targetGroupName = '';
+      let isAlreadyRegistered = false;
+
+      // Atomic transaction: reads latest cloud state, appends student, commits back
+      await runTransaction(db, async (transaction) => {
+        const subDoc = await transaction.get(subjectDocRef);
+        if (!subDoc.exists()) {
+          throw new Error('المادة غير موجودة في السحابة');
+        }
+
+        const data = subDoc.data();
+        const cloudGroups: Group[] = Array.isArray(data.groups) ? data.groups : [];
+
+        const updatedGroups = cloudGroups.map(group => {
+          if (group.id === groupId) {
+            targetGroupName = group.name;
+            const currentMembers = Array.isArray(group.members) ? group.members : [];
+            // Prevent duplicate registration if name already exists in cloud
+            if (currentMembers.includes(cleanName)) {
+              isAlreadyRegistered = true;
+              return group;
+            }
+            return {
+              ...group,
+              members: [...currentMembers, cleanName]
+            };
+          }
+          return group;
+        });
+
+        transaction.update(subjectDocRef, { groups: updatedGroups });
+      });
+
+      // Clear from pending since it's now officially written into cloud
+      setPendingMembers(prev => ({
+        ...prev,
+        [groupId]: (prev[groupId] || []).filter(name => name !== cleanName)
+      }));
+
+      if (isAlreadyRegistered) {
+        showToast(`الطالب "${cleanName}" مسجل بالفعل في هذه المجموعة!`);
+      } else {
+        addLog(`انضم الطالب "${cleanName}" إلى ${targetGroupName}`);
+        showToast(`تم تسجيل الطالب "${cleanName}" بنجاح وتأمينه سحابياً! ✅`);
+      }
+    } catch (err) {
+      console.error('Transaction failed for addMember:', err);
+      // Rollback optimistic state
+      setPendingMembers(prev => ({
+        ...prev,
+        [groupId]: (prev[groupId] || []).filter(name => name !== cleanName)
+      }));
+      // Restore input text so the student does not have to retype
+      setMemberInputs(prev => ({ ...prev, [groupId]: cleanName }));
+      showToast('تعذر الحفظ في السحابة، أعد المحاولة');
+    } finally {
+      setSavingGroup(prev => ({ ...prev, [groupId]: false }));
+    }
   };
 
-  // Rename group
+  // Rename group using Firestore Transaction (Concurrency Safe)
   const handleSaveRename = async (groupId: string) => {
     if (!selectedSubjectId || !editingGroupName.trim()) {
       setEditingGroupId(null);
       return;
     }
-    const currentSubject = subjects.find(s => s.id === selectedSubjectId);
-    if (!currentSubject) return;
 
-    const updatedGroups = currentSubject.groups.map(g => {
-      if (g.id === groupId) return { ...g, name: editingGroupName.trim() };
-      return g;
-    });
+    const newName = editingGroupName.trim();
+    try {
+      const subjectDocRef = doc(db, 'subjects', selectedSubjectId);
 
-    const updatedSubject: Subject = {
-      ...currentSubject,
-      groups: updatedGroups
-    };
+      await runTransaction(db, async (transaction) => {
+        const subDoc = await transaction.get(subjectDocRef);
+        if (!subDoc.exists()) return;
 
-    setSubjects(prev => prev.map(s => (s.id === selectedSubjectId ? updatedSubject : s)));
-    syncSubjectDoc(updatedSubject);
+        const data = subDoc.data();
+        const cloudGroups: Group[] = Array.isArray(data.groups) ? data.groups : [];
 
-    setEditingGroupId(null);
-    showToast('تم تعديل اسم المجموعة');
+        // Update ONLY the group name, leaving all members untouched
+        const updatedGroups = cloudGroups.map(g => {
+          if (g.id === groupId) return { ...g, name: newName };
+          return g;
+        });
+
+        transaction.update(subjectDocRef, { groups: updatedGroups });
+      });
+
+      setEditingGroupId(null);
+      showToast('تم تعديل اسم المجموعة سحابياً');
+    } catch (err) {
+      console.error('Error renaming group in transaction:', err);
+      showToast('حدث خطأ أثناء تعديل الاسم');
+    }
   };
 
   // Request deletion handlers (all require passcode 'imad')
@@ -390,7 +477,7 @@ export default function App() {
     setPasscodeError(null);
   };
 
-  // Confirm delete with passcode 'imad'
+  // Confirm delete with passcode 'imad' using atomic transactions
   const handleConfirmDelete = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!pendingDelete) return;
@@ -402,48 +489,67 @@ export default function App() {
 
     // Code is 'imad' -> perform requested delete
     if (pendingDelete.type === 'subject') {
-      setSubjects(prev => prev.filter(s => s.id !== pendingDelete.subjectId));
-      removeSubjectDoc(pendingDelete.subjectId);
-
-      if (selectedSubjectId === pendingDelete.subjectId) {
-        setSelectedSubjectId(null);
-        setActiveTab('home');
+      try {
+        await deleteDoc(doc(db, 'subjects', pendingDelete.subjectId));
+        if (selectedSubjectId === pendingDelete.subjectId) {
+          setSelectedSubjectId(null);
+          setActiveTab('home');
+        }
+        addLog(`تم حذف المادة "${pendingDelete.subjectName}"`);
+        showToast(`تم حذف المادة "${pendingDelete.subjectName}" بنجاح 🗑️`);
+      } catch (err) {
+        console.error('Error deleting subject:', err);
       }
-      addLog(`تم حذف المادة "${pendingDelete.subjectName}"`);
-      showToast(`تم حذف المادة "${pendingDelete.subjectName}" بنجاح 🗑️`);
     } else if (pendingDelete.type === 'group' && pendingDelete.groupId) {
-      const currentSub = subjects.find(s => s.id === pendingDelete.subjectId);
-      if (currentSub) {
-        const updatedSub: Subject = {
-          ...currentSub,
-          groups: currentSub.groups.filter(g => g.id !== pendingDelete.groupId)
-        };
-        setSubjects(prev => prev.map(s => (s.id === pendingDelete.subjectId ? updatedSub : s)));
-        syncSubjectDoc(updatedSub);
-      }
-      addLog(`تم حذف ${pendingDelete.groupName}`);
-      showToast(`تم حذف ${pendingDelete.groupName} بنجاح 🗑️`);
-    } else if (pendingDelete.type === 'member' && pendingDelete.groupId && typeof pendingDelete.memberIndex === 'number') {
-      const idx = pendingDelete.memberIndex;
-      const currentSub = subjects.find(s => s.id === pendingDelete.subjectId);
-      if (currentSub) {
-        const updatedGroups = currentSub.groups.map(g => {
-          if (g.id === pendingDelete.groupId) {
-            const updatedMembers = [...g.members];
-            updatedMembers.splice(idx, 1);
-            return { ...g, members: updatedMembers };
-          }
-          return g;
+      const targetGroupId = pendingDelete.groupId;
+      try {
+        const subjectDocRef = doc(db, 'subjects', pendingDelete.subjectId);
+        await runTransaction(db, async (transaction) => {
+          const subDoc = await transaction.get(subjectDocRef);
+          if (!subDoc.exists()) return;
+
+          const data = subDoc.data();
+          const cloudGroups: Group[] = Array.isArray(data.groups) ? data.groups : [];
+          const updatedGroups = cloudGroups.filter(g => g.id !== targetGroupId);
+
+          transaction.update(subjectDocRef, { groups: updatedGroups });
         });
-        const updatedSub: Subject = {
-          ...currentSub,
-          groups: updatedGroups
-        };
-        setSubjects(prev => prev.map(s => (s.id === pendingDelete.subjectId ? updatedSub : s)));
-        syncSubjectDoc(updatedSub);
+        addLog(`تم حذف ${pendingDelete.groupName}`);
+        showToast(`تم حذف ${pendingDelete.groupName} بنجاح 🗑️`);
+      } catch (err) {
+        console.error('Error deleting group in transaction:', err);
       }
-      addLog(`تم حذف الطالب "${pendingDelete.memberName}" من ${pendingDelete.groupName}`);
-      showToast(`تم حذف الطالب "${pendingDelete.memberName}" بنجاح 🗑️`);
+    } else if (pendingDelete.type === 'member' && pendingDelete.groupId && pendingDelete.memberName) {
+      const targetMember = pendingDelete.memberName;
+      const targetGroupId = pendingDelete.groupId;
+
+      try {
+        const subjectDocRef = doc(db, 'subjects', pendingDelete.subjectId);
+        await runTransaction(db, async (transaction) => {
+          const subDoc = await transaction.get(subjectDocRef);
+          if (!subDoc.exists()) return;
+
+          const data = subDoc.data();
+          const cloudGroups: Group[] = Array.isArray(data.groups) ? data.groups : [];
+
+          const updatedGroups = cloudGroups.map(g => {
+            if (g.id === targetGroupId) {
+              const currentMembers = Array.isArray(g.members) ? g.members : [];
+              return {
+                ...g,
+                members: currentMembers.filter(m => m !== targetMember)
+              };
+            }
+            return g;
+          });
+
+          transaction.update(subjectDocRef, { groups: updatedGroups });
+        });
+        addLog(`تم حذف الطالب "${targetMember}" من ${pendingDelete.groupName}`);
+        showToast(`تم حذف الطالب "${targetMember}" بنجاح 🗑️`);
+      } catch (err) {
+        console.error('Error deleting member in transaction:', err);
+      }
     }
 
     setPendingDelete(null);
@@ -474,139 +580,110 @@ export default function App() {
     window.open(`https://api.whatsapp.com/send?text=${text}`, '_blank');
   };
 
-  // Generate downloadable HTML file for PDF printing
-  const generatePdfHtml = (subject: Subject) => {
-    const dateStr = new Date().toLocaleDateString('ar-EG', {
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric'
-    });
-
-    return `<!DOCTYPE html>
-<html dir="rtl" lang="ar">
-<head>
-  <meta charset="utf-8">
-  <title>كشف مجموعات - ${subject.name}</title>
-  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    body { font-family: 'Cairo', sans-serif; margin: 25px; color: #1e293b; direction: rtl; background: #fff; }
-    .header-box { text-align: center; border-bottom: 3px double #5925dc; padding-bottom: 15px; margin-bottom: 25px; }
-    .main-title { font-size: 24px; font-weight: 800; color: #5925dc; margin: 0 0 6px 0; }
-    .sub-title { font-size: 14px; color: #64748b; margin: 0; }
-    .info-bar { display: flex; justify-content: space-between; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 18px; margin-bottom: 25px; font-size: 13px; }
-    .info-item { display: flex; gap: 6px; }
-    .info-item strong { color: #0f172a; }
-    .group-section { margin-bottom: 25px; border: 1px solid #cbd5e1; border-radius: 10px; overflow: hidden; page-break-inside: avoid; }
-    .group-title-bar { background: #5925dc; color: #ffffff; padding: 10px 16px; font-weight: 700; font-size: 15px; display: flex; justify-content: space-between; }
-    table { width: 100%; border-collapse: collapse; text-align: right; }
-    th { background: #f1f5f9; padding: 10px 14px; border-bottom: 2px solid #cbd5e1; font-size: 13px; font-weight: 700; color: #334155; }
-    td { padding: 9px 14px; border-bottom: 1px solid #e2e8f0; font-size: 13px; }
-    tr:nth-child(even) { background-color: #f8fafc; }
-    .signature-cell { width: 160px; color: #94a3b8; font-family: monospace; }
-    .empty-msg { padding: 16px; text-align: center; color: #94a3b8; font-size: 13px; font-style: italic; }
-    .footer-box { margin-top: 40px; display: flex; justify-content: space-between; border-top: 1px solid #cbd5e1; padding-top: 15px; font-size: 12px; color: #64748b; }
-    @media print {
-      body { margin: 10mm; }
-      .no-print { display: none !important; }
+  // Download real PDF file using html2pdf.js (instead of raw HTML code)
+  const handleDownloadPdf = async (subject: Subject) => {
+    const element = document.getElementById('printable-groups-pdf-content');
+    if (!element) {
+      window.print();
+      return;
     }
-  </style>
-</head>
-<body>
-  <div class="header-box">
-    <h1 class="main-title">كشف تفويج المجموعات لمشاريع الطلبة</h1>
-    <p class="sub-title">الجمهورية الجزائرية الديمقراطية الشعبية • وزارة التعليم العالي والبحث العلمي</p>
-  </div>
 
-  <div class="info-bar">
-    <div class="info-item"><strong>المادة:</strong> <span>${subject.name}</span></div>
-    <div class="info-item"><strong>الأستاذ المشرف:</strong> <span>${subject.professorName || 'أستاذ المادة'}</span></div>
-    <div class="info-item"><strong>التاريخ:</strong> <span>${dateStr}</span></div>
-    <div class="info-item"><strong>إجمالي المجموعات:</strong> <span>${subject.groups.length}</span></div>
-  </div>
+    setIsGeneratingPdf(true);
+    showToast('جاري إنشاء وتحميل ملف الـ PDF... ⏳');
 
-  ${subject.groups.length === 0 ? '<div class="empty-msg">لا توجد مجموعات مسجلة في هذه المادة بعد.</div>' : 
-    subject.groups.map(group => `
-      <div class="group-section">
-        <div class="group-title-bar">
-          <span>${group.name}</span>
-          <span>عدد الطلبة: ${group.members.length}</span>
-        </div>
-        ${group.members.length === 0 ? '<div class="empty-msg">لم يتم تسجيل طلبة في هذه المجموعة بعد</div>' : `
-          <table>
-            <thead>
-              <tr>
-                <th style="width: 50px;">#</th>
-                <th>اسم ولقب الطالب</th>
-                <th style="width: 170px;">التوقيع / ملاحظة الأستاذ</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${group.members.map((member, idx) => `
-                <tr>
-                  <td><strong>${idx + 1}</strong></td>
-                  <td>${member}</td>
-                  <td class="signature-cell">........................</td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        `}
-      </div>
-    `).join('')
-  }
+    try {
+      const opt = {
+        margin: [10, 10, 10, 10],
+        filename: `كشف_مجموعات_${subject.name.replace(/\s+/g, '_')}.pdf`,
+        image: { type: 'jpeg', quality: 0.98 },
+        html2canvas: { scale: 2, useCORS: true, logging: false },
+        jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
+      };
 
-  <div class="footer-box">
-    <div><strong>توقيع وختم الأستاذ:</strong> ........................................</div>
-    <div>تم الاستخراج بتاريخ: ${new Date().toLocaleDateString('ar-EG')}</div>
-  </div>
-</body>
-</html>`;
-  };
-
-  const handleDownloadHtmlFile = (subject: Subject) => {
-    const htmlContent = generatePdfHtml(subject);
-    const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `كشف_${subject.name.replace(/\s+/g, '_')}_PDF.html`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showToast('تم تحميل كشف الأستاذ بنجاح! 📥');
+      // @ts-ignore
+      await html2pdf().set(opt).from(element).save();
+      showToast('تم تحميل كشف المجموعات كـ PDF بنجاح! 📄');
+    } catch (err) {
+      console.error('PDF export error, falling back to print:', err);
+      window.print();
+    } finally {
+      setIsGeneratingPdf(false);
+    }
   };
 
   const handlePrintPdf = () => {
     window.print();
   };
 
+  // Copy subject groups and members as clean text to clipboard
+  const handleCopySubjectGroups = (subject: Subject) => {
+    let text = `📋 كشف مجموعات مادة: ${subject.name}\n👨‍🏫 الأستاذ: ${subject.professorName || 'أستاذ المادة'}\n\n`;
+    if (subject.groups.length === 0) {
+      text += 'لا توجد مجموعات مسجلة بعد.';
+    } else {
+      subject.groups.forEach((g) => {
+        text += `🔹 ${g.name} (${g.members.length} طلاب):\n`;
+        if (g.members.length === 0) {
+          text += '  (لا يوجد طلبة مسجلين بعد)\n';
+        } else {
+          g.members.forEach((m, idx) => {
+            text += `  ${idx + 1}. ${m}\n`;
+          });
+        }
+        text += '\n';
+      });
+    }
+    navigator.clipboard.writeText(text);
+    showToast('تم نسخ قائمة المجموعات والأسماء بنجاح! 📋');
+  };
+
+  // Share subject groups and members directly to WhatsApp
+  const handleShareSubjectWhatsApp = (subject: Subject) => {
+    let text = `📋 *كشف مجموعات مادة: ${subject.name}*\n👨‍🏫 *الأستاذ:* ${subject.professorName || 'أستاذ المادة'}\n\n`;
+    if (subject.groups.length === 0) {
+      text += 'لا توجد مجموعات مسجلة بعد.';
+    } else {
+      subject.groups.forEach((g) => {
+        text += `🔹 *${g.name}* (${g.members.length} طلاب):\n`;
+        if (g.members.length === 0) {
+          text += '  (فارغة)\n';
+        } else {
+          g.members.forEach((m, idx) => {
+            text += `  ${idx + 1}. ${m}\n`;
+          });
+        }
+        text += '\n';
+      });
+    }
+    window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`, '_blank');
+  };
+
   // Current active subject object
   const currentSubject = subjects.find(s => s.id === selectedSubjectId);
 
-  // Overall Statistics
+  // Overall Statistics including optimistic pending registrations
+  const pendingStudentsCount = Object.values(pendingMembers).reduce((acc, list) => acc + list.length, 0);
   const totalGroups = subjects.reduce((acc, s) => acc + s.groups.length, 0);
-  const totalStudents = subjects.reduce((acc, s) => acc + s.groups.reduce((gAcc, g) => gAcc + g.members.length, 0), 0);
+  const totalStudents = subjects.reduce((acc, s) => acc + s.groups.reduce((gAcc, g) => gAcc + g.members.length, 0), 0) + pendingStudentsCount;
 
   // Teacher message helper
   const teacherMessage = "السلام عليكم أستاذ، هذا تطبيق تسجيل مجموعات المشاريع. أضف المادة أولاً واكتب اسمها، ثم اضغط عليها للدخول، وبعدها أنشئ المجموعات وسجّل أسماء الطلبة داخل كل مجموعة.";
 
   return (
-    <div className="min-h-screen bg-slate-100 flex flex-col items-center justify-start py-0 sm:py-6 sm:px-4">
+    <div className="min-h-[100dvh] h-[100dvh] bg-slate-100 flex flex-col items-center justify-start overflow-hidden">
       {/* Container simulating mobile frame */}
-      <div className="w-full max-w-md bg-white min-h-screen sm:min-h-[840px] sm:max-h-[92vh] sm:rounded-3xl shadow-xl flex flex-col overflow-hidden border border-slate-200/80 relative">
+      <div className="w-full max-w-md bg-white h-full sm:h-[94vh] sm:my-auto sm:rounded-3xl shadow-xl flex flex-col overflow-hidden border border-slate-200/80 relative">
         
         {/* Toast Notification */}
         {notificationMsg && (
-          <div className="no-print absolute top-16 left-1/2 -translate-x-1/2 z-50 bg-slate-900/90 text-white text-xs px-4 py-2.5 rounded-full shadow-lg backdrop-blur flex items-center gap-2 animate-fade-in transition-all">
+          <div className="no-print absolute top-20 left-1/2 -translate-x-1/2 z-50 bg-slate-900/90 text-white text-xs px-4 py-2.5 rounded-full shadow-lg backdrop-blur flex items-center gap-2 animate-fade-in transition-all">
             <Sparkles className="w-3.5 h-3.5 text-purple-400" />
             <span className="font-medium">{notificationMsg}</span>
           </div>
         )}
 
-        {/* Top Header */}
-        <header className="no-print bg-[#5925dc] text-white px-5 py-4 flex items-center justify-between shadow-md shrink-0">
+        {/* Top Header - Sticky so it stays visible during scroll */}
+        <header className="no-print sticky top-0 z-30 bg-[#5925dc] text-white px-5 py-3.5 flex items-center justify-between shadow-md shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center backdrop-blur-sm">
               <GraduationCap className="w-5 h-5 text-white" />
@@ -614,10 +691,21 @@ export default function App() {
             <div>
               <div className="flex items-center gap-1.5">
                 <h1 className="font-extrabold text-lg tracking-tight">تسجيل مجموعات المشاريع</h1>
-                <span className="flex items-center gap-1 bg-emerald-500/25 border border-emerald-400/40 text-emerald-200 text-[10px] px-2 py-0.5 rounded-full font-bold">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                  <span>مباشر</span>
-                </span>
+                {hasPendingWrites ? (
+                  <span className="flex items-center gap-1 bg-amber-500/30 border border-amber-300/60 text-amber-100 text-[10px] px-2 py-0.5 rounded-full font-bold animate-pulse">
+                    <Loader2 className="w-2.5 h-2.5 animate-spin text-amber-200" />
+                    <span>جارٍ الحفظ...</span>
+                  </span>
+                ) : isCloudSynced ? (
+                  <span className="flex items-center gap-1 bg-emerald-500/25 border border-emerald-400/40 text-emerald-200 text-[10px] px-2 py-0.5 rounded-full font-bold">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span>سحابي مباشر</span>
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1 bg-rose-500/25 border border-rose-400/40 text-rose-200 text-[10px] px-2 py-0.5 rounded-full font-bold">
+                    <span>غير متصل</span>
+                  </span>
+                )}
               </div>
               <p className="text-[11px] text-purple-200">
                 {currentSubject ? `المادة: ${currentSubject.name}` : `${subjects.length} مواد • ${totalStudents} طالب مسجل`}
@@ -755,8 +843,8 @@ export default function App() {
           </div>
         )}
 
-        {/* Main Content Area */}
-        <main className="no-print flex-1 overflow-y-auto p-4 space-y-4">
+        {/* Main Content Area with bottom padding for fixed navbar */}
+        <main className="no-print flex-1 overflow-y-auto p-4 space-y-4 pb-28">
 
           {/* VIEW 1: SUBJECTS LIST (Homepage or Groups without selected subject) */}
           {(activeTab === 'home' || (!selectedSubjectId && activeTab === 'groups')) && (
@@ -901,6 +989,24 @@ export default function App() {
                 currentSubject.groups.map((group) => {
                   const currentInput = memberInputs[group.id] || '';
                   const isEditing = editingGroupId === group.id;
+                  const isSaving = !!savingGroup[group.id];
+                  const currentGroupPending = pendingMembers[group.id] || [];
+                  const activePending = currentGroupPending.filter(name => !group.members.includes(name));
+                  const combinedMembers = [
+                    ...group.members.map((name, i) => ({ 
+                      id: `member_${group.id}_${name}_${i}`, 
+                      name, 
+                      isPending: false, 
+                      realIndex: i 
+                    })),
+                    ...activePending.map((name) => ({ 
+                      id: `pending_${group.id}_${name}`, 
+                      name, 
+                      isPending: true, 
+                      realIndex: -1 
+                    }))
+                  ];
+                  const displayTotalCount = combinedMembers.length;
 
                   return (
                     <div 
@@ -911,7 +1017,7 @@ export default function App() {
                       <div className="bg-purple-50/70 px-4 py-3 border-b border-purple-100/60 flex items-center justify-between">
                         <div className="flex items-center gap-2 flex-1 min-w-0">
                           <div className="w-7 h-7 rounded-lg bg-[#5925dc] text-white flex items-center justify-center text-xs font-bold shadow-sm shrink-0">
-                            {group.members.length}
+                            {displayTotalCount}
                           </div>
                           
                           {isEditing ? (
@@ -958,8 +1064,11 @@ export default function App() {
                             </div>
                           )}
 
-                          <span className="text-[11px] text-purple-700 font-medium bg-purple-100/80 px-2 py-0.5 rounded-full shrink-0">
-                            {group.members.length} {group.members.length === 1 ? 'طالب' : 'طلاب'}
+                          <span className="text-[11px] text-purple-700 font-medium bg-purple-100/80 px-2 py-0.5 rounded-full shrink-0 flex items-center gap-1">
+                            <span>{displayTotalCount} {displayTotalCount === 1 ? 'طالب' : 'طلاب'}</span>
+                            {activePending.length > 0 && (
+                              <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping"></span>
+                            )}
                           </span>
                         </div>
 
@@ -1010,51 +1119,77 @@ export default function App() {
                             <input
                               type="text"
                               value={currentInput}
+                              disabled={isSaving}
                               onChange={(e) => setMemberInputs(prev => ({ ...prev, [group.id]: e.target.value }))}
-                              placeholder="اكتب اسم الطالب داخل المجموعة..."
-                              className="w-full bg-white border border-slate-300 focus:border-[#5925dc] focus:ring-2 focus:ring-purple-200 rounded-xl px-3.5 py-2.5 text-sm text-slate-800 placeholder:text-slate-400 outline-none transition"
+                              placeholder={isSaving ? "جارٍ تسجيل وحفظ الاسم سحابياً..." : "اكتب اسم الطالب داخل المجموعة..."}
+                              className="w-full bg-white disabled:bg-slate-100/80 border border-slate-300 focus:border-[#5925dc] focus:ring-2 focus:ring-purple-200 rounded-xl px-3.5 py-2.5 text-sm text-slate-800 placeholder:text-slate-400 outline-none transition"
                             />
                           </div>
                           <button
                             type="submit"
-                            disabled={!currentInput.trim()}
+                            disabled={!currentInput.trim() || isSaving}
                             className="bg-[#5925dc] disabled:bg-slate-300 disabled:cursor-not-allowed hover:bg-[#491cbd] text-white px-4 py-2.5 rounded-xl font-bold text-xs sm:text-sm flex items-center gap-1.5 shrink-0 transition shadow-sm cursor-pointer"
                           >
-                            <UserPlus className="w-4 h-4" />
-                            <span>تسجيل</span>
+                            {isSaving ? (
+                              <>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                <span>تسجيل...</span>
+                              </>
+                            ) : (
+                              <>
+                                <UserPlus className="w-4 h-4" />
+                                <span>تسجيل</span>
+                              </>
+                            )}
                           </button>
                         </form>
                       </div>
 
                       {/* Members / Students List */}
                       <div className="p-3">
-                        {group.members.length === 0 ? (
+                        {combinedMembers.length === 0 ? (
                           <div className="py-3 text-center text-xs text-slate-400 italic">
                             لم يتم تسجيل أي طالب بعد، اكتب اسم الطالب واضغط تسجيل!
                           </div>
                         ) : (
                           <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                            {group.members.map((member, idx) => (
+                            {combinedMembers.map((item, idx) => (
                               <div 
-                                key={idx}
-                                className="flex items-center justify-between bg-slate-50 hover:bg-purple-50/50 px-3 py-2 rounded-xl text-sm border border-slate-100 transition group"
+                                key={item.id}
+                                className={`flex items-center justify-between px-3 py-2 rounded-xl text-sm border transition group ${
+                                  item.isPending 
+                                    ? 'bg-amber-50/90 border-amber-200/80 text-amber-950 shadow-xs' 
+                                    : 'bg-slate-50 hover:bg-purple-50/50 border-slate-100 text-slate-800'
+                                }`}
                               >
                                 <div className="flex items-center gap-2.5 min-w-0">
-                                  <span className="w-5 h-5 rounded-full bg-purple-100 text-purple-700 text-xs font-bold flex items-center justify-center shrink-0">
+                                  <span className={`w-5 h-5 rounded-full text-xs font-bold flex items-center justify-center shrink-0 ${
+                                    item.isPending 
+                                      ? 'bg-amber-200 text-amber-800' 
+                                      : 'bg-purple-100 text-purple-700'
+                                  }`}>
                                     {idx + 1}
                                   </span>
-                                  <span className="font-semibold text-slate-700 truncate">
-                                    {member}
+                                  <span className="font-semibold truncate">
+                                    {item.name}
                                   </span>
+                                  {item.isPending && (
+                                    <span className="text-[10px] bg-amber-200 text-amber-900 font-bold px-1.5 py-0.5 rounded-md flex items-center gap-1 shrink-0 animate-pulse">
+                                      <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                      <span>جارٍ الحفظ...</span>
+                                    </span>
+                                  )}
                                 </div>
 
-                                <button
-                                  onClick={() => requestDeleteMember(currentSubject.id, group.id, group.name, idx, member)}
-                                  title="حذف الطالب من المجموعة (يتطلب الرمز)"
-                                  className="text-rose-400 hover:text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg transition cursor-pointer"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5 text-rose-500" />
-                                </button>
+                                {!item.isPending && (
+                                  <button
+                                    onClick={() => requestDeleteMember(currentSubject.id, group.id, group.name, item.realIndex, item.name)}
+                                    title="حذف الطالب من المجموعة (يتطلب الرمز)"
+                                    className="text-rose-400 hover:text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg transition cursor-pointer"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                                  </button>
+                                )}
                               </div>
                             ))}
                           </div>
@@ -1182,8 +1317,8 @@ export default function App() {
 
         </main>
 
-        {/* Bottom Navigation Bar */}
-        <nav className="no-print bg-white border-t border-slate-200 px-4 py-2.5 flex items-center justify-around shadow-sm shrink-0">
+        {/* Bottom Navigation Bar - Pinned at bottom and stays visible during scroll */}
+        <nav className="no-print fixed sm:sticky bottom-0 left-0 right-0 max-w-md mx-auto z-40 bg-white/95 backdrop-blur-md border-t border-slate-200 px-4 py-2.5 flex items-center justify-around shadow-[0_-4px_20px_rgba(0,0,0,0.08)] shrink-0">
           <button 
             onClick={() => {
               setSelectedSubjectId(null);
@@ -1334,8 +1469,8 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <FileText className="w-5 h-5 text-emerald-400" />
                   <div>
-                    <h3 className="font-extrabold text-sm sm:text-base">تحميل كشف المادة (PDF)</h3>
-                    <p className="text-[11px] text-slate-300">جاهز للحفظ بتنسيق PDF أو الطباعة المباشرة</p>
+                    <h3 className="font-extrabold text-sm sm:text-base">تحميل كشف المجموعات (PDF)</h3>
+                    <p className="text-[11px] text-slate-300">تحميل ملف PDF حقيقي يحتوي فقط على المجموعات وأفرادها</p>
                   </div>
                 </div>
                 <button
@@ -1348,61 +1483,78 @@ export default function App() {
 
               {/* Action Buttons Header inside Modal */}
               <div className="no-print bg-emerald-50/70 border-b border-emerald-100 p-3 flex flex-wrap items-center justify-between gap-2 shrink-0">
-                <div className="text-xs text-emerald-900 font-medium">
-                  اختر الطريقة المناسبة لحفظ أو طباعة الكشف:
+                <div className="text-xs text-emerald-900 font-semibold flex items-center gap-1.5">
+                  <span>المادة:</span>
+                  <span className="font-bold text-emerald-700 bg-white px-2 py-0.5 rounded-md border border-emerald-200">
+                    {pdfSubject.name}
+                  </span>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-1.5">
                   <button
-                    onClick={handlePrintPdf}
-                    className="bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-bold text-xs px-3.5 py-2 rounded-xl transition flex items-center gap-1.5 shadow-sm cursor-pointer"
+                    onClick={() => handleDownloadPdf(pdfSubject)}
+                    disabled={isGeneratingPdf}
+                    className="bg-emerald-600 hover:bg-emerald-700 active:scale-95 disabled:bg-emerald-400 text-white font-bold text-xs px-3.5 py-2 rounded-xl transition flex items-center gap-1.5 shadow-sm cursor-pointer"
+                    title="تحميل ملف PDF مباشر لجهازك"
                   >
-                    <Printer className="w-4 h-4" />
-                    <span>طباعة / حفظ PDF</span>
+                    {isGeneratingPdf ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Download className="w-4 h-4" />
+                    )}
+                    <span>{isGeneratingPdf ? 'جاري التحميل...' : 'تحميل PDF (ملف جاهز)'}</span>
                   </button>
                   <button
-                    onClick={() => handleDownloadHtmlFile(pdfSubject)}
-                    className="bg-white hover:bg-slate-50 border border-emerald-300 text-emerald-800 font-bold text-xs px-3 py-2 rounded-xl transition flex items-center gap-1.5 shadow-xs cursor-pointer"
+                    onClick={handlePrintPdf}
+                    className="bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 font-bold text-xs px-2.5 py-2 rounded-xl transition flex items-center gap-1 shadow-xs cursor-pointer"
+                    title="طباعة أو حفظ مباشر عبر المتصفح"
                   >
-                    <Download className="w-4 h-4 text-emerald-600" />
-                    <span>تنزيل ملف الكشف</span>
+                    <Printer className="w-4 h-4 text-slate-600" />
+                    <span>طباعة</span>
+                  </button>
+                  <button
+                    onClick={() => handleShareSubjectWhatsApp(pdfSubject)}
+                    className="bg-emerald-100 hover:bg-emerald-200 text-emerald-800 font-bold text-xs px-2.5 py-2 rounded-xl transition flex items-center gap-1 cursor-pointer"
+                    title="مشاركة المجموعات في واتساب"
+                  >
+                    <MessageCircle className="w-4 h-4 text-emerald-600" />
+                    <span>واتساب</span>
+                  </button>
+                  <button
+                    onClick={() => handleCopySubjectGroups(pdfSubject)}
+                    className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-2.5 py-2 rounded-xl transition flex items-center gap-1 cursor-pointer"
+                    title="نسخ قائمة المجموعات والأسماء"
+                  >
+                    <Copy className="w-4 h-4 text-slate-600" />
+                    <span>نسخ</span>
                   </button>
                 </div>
               </div>
 
               {/* Printable PDF Document View */}
-              <div className="flex-1 overflow-y-auto p-6 bg-slate-50">
-                <div className="bg-white p-6 sm:p-8 rounded-2xl shadow-sm border border-slate-200 text-slate-800 space-y-6">
-                  {/* Document Header */}
-                  <div className="text-center border-b-2 border-[#5925dc] pb-4">
-                    <h2 className="text-xl sm:text-2xl font-black text-[#5925dc] mb-1">
-                      كشف تفويج المجموعات لمشاريع الطلبة
+              <div className="flex-1 overflow-y-auto p-4 sm:p-6 bg-slate-100/70">
+                <div 
+                  id="printable-groups-pdf-content" 
+                  className="bg-white p-6 sm:p-8 rounded-2xl shadow-sm border border-slate-200 text-slate-800 space-y-5"
+                >
+                  {/* Clean Document Header (Subject and Professor info only, no code) */}
+                  <div className="border-b-2 border-[#5925dc] pb-3 text-center">
+                    <h2 className="text-xl sm:text-2xl font-black text-slate-900 mb-1">
+                      كشف مجموعات مادة: {pdfSubject.name}
                     </h2>
-                    <p className="text-xs text-slate-500">
-                      الجمهورية الجزائرية الديمقراطية الشعبية • وزارة التعليم العالي والبحث العلمي
-                    </p>
-                  </div>
-
-                  {/* Information Bar */}
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-xs">
-                    <div>
-                      <span className="text-slate-400 block text-[10px]">المادة الدراسية:</span>
-                      <strong className="text-slate-900 text-sm">{pdfSubject.name}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[10px]">الأستاذ المشرف:</span>
-                      <strong className="text-purple-700 text-sm">{pdfSubject.professorName || 'أستاذ المادة'}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[10px]">تاريخ الكشف:</span>
-                      <strong className="text-slate-700 text-xs">{new Date().toLocaleDateString('ar-EG')}</strong>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[10px]">إجمالي المجموعات:</span>
-                      <strong className="text-slate-700 text-sm">{pdfSubject.groups.length} مجموعات</strong>
+                    <div className="flex flex-wrap items-center justify-center gap-3 text-xs text-slate-600 mt-2">
+                      <span className="bg-purple-50 text-purple-800 font-bold px-2.5 py-1 rounded-lg border border-purple-100">
+                        👨‍🏫 الأستاذ المشرف: {pdfSubject.professorName || 'أستاذ المادة'}
+                      </span>
+                      <span className="bg-slate-50 text-slate-600 font-medium px-2.5 py-1 rounded-lg border border-slate-200">
+                        📅 التاريخ: {new Date().toLocaleDateString('ar-EG')}
+                      </span>
+                      <span className="bg-slate-50 text-slate-600 font-medium px-2.5 py-1 rounded-lg border border-slate-200">
+                        👥 إجمالي المجموعات: {pdfSubject.groups.length}
+                      </span>
                     </div>
                   </div>
 
-                  {/* Groups Tables */}
+                  {/* Groups: STRICTLY Group Names and their Members */}
                   <div className="space-y-4">
                     {pdfSubject.groups.length === 0 ? (
                       <div className="text-center py-8 text-slate-400 text-xs italic">
@@ -1410,30 +1562,33 @@ export default function App() {
                       </div>
                     ) : (
                       pdfSubject.groups.map((group) => (
-                        <div key={group.id} className="border border-slate-200 rounded-xl overflow-hidden">
-                          <div className="bg-[#5925dc] text-white px-4 py-2 text-xs sm:text-sm font-bold flex items-center justify-between">
-                            <span>{group.name}</span>
-                            <span className="text-purple-200 font-normal">{group.members.length} طلاب</span>
+                        <div key={group.id} className="border border-slate-300 rounded-xl overflow-hidden page-break-inside-avoid">
+                          {/* Group Name Banner */}
+                          <div className="bg-[#5925dc] text-white px-4 py-2 text-sm font-bold flex items-center justify-between">
+                            <span className="text-base">{group.name}</span>
+                            <span className="text-purple-100 text-xs bg-white/20 px-2.5 py-0.5 rounded-full font-semibold">
+                              {group.members.length} {group.members.length === 1 ? 'طالب' : 'طلبة'}
+                            </span>
                           </div>
+
+                          {/* Members / Students in this group */}
                           {group.members.length === 0 ? (
                             <div className="p-3 text-center text-xs text-slate-400 italic">
-                              المجموعة فارغة حالياً
+                              لا يوجد طلبة مسجلين في هذه المجموعة حتى الآن
                             </div>
                           ) : (
                             <table className="w-full text-right text-xs">
-                              <thead className="bg-slate-100 text-slate-600 border-b border-slate-200">
+                              <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
                                 <tr>
-                                  <th className="p-2.5 w-10 text-center font-bold">#</th>
+                                  <th className="p-2.5 w-12 text-center font-bold">#</th>
                                   <th className="p-2.5 font-bold">اسم ولقب الطالب</th>
-                                  <th className="p-2.5 w-36 text-center font-bold">توقيع الطالب</th>
                                 </tr>
                               </thead>
                               <tbody className="divide-y divide-slate-100">
                                 {group.members.map((member, idx) => (
-                                  <tr key={idx} className="hover:bg-slate-50/50">
-                                    <td className="p-2.5 text-center font-bold text-slate-500">{idx + 1}</td>
-                                    <td className="p-2.5 font-semibold text-slate-800">{member}</td>
-                                    <td className="p-2.5 text-center text-slate-300 font-mono text-[10px]">....................</td>
+                                  <tr key={idx} className={idx % 2 === 0 ? 'bg-white' : 'bg-slate-50/60'}>
+                                    <td className="p-2.5 text-center font-bold text-purple-700 bg-purple-50/30">{idx + 1}</td>
+                                    <td className="p-2.5 font-bold text-slate-800 text-sm">{member}</td>
                                   </tr>
                                 ))}
                               </tbody>
@@ -1443,24 +1598,13 @@ export default function App() {
                       ))
                     )}
                   </div>
-
-                  {/* Document Footer Signature */}
-                  <div className="border-t border-slate-200 pt-5 flex items-center justify-between text-xs text-slate-500">
-                    <div>
-                      <span className="block font-bold text-slate-700">توقيع وخاتم الأستاذ:</span>
-                      <span className="text-slate-300 font-mono">........................................</span>
-                    </div>
-                    <div className="text-left text-[11px] text-slate-400">
-                      تم استخراج الكشف إلكترونياً
-                    </div>
-                  </div>
                 </div>
               </div>
 
               {/* Modal Footer */}
               <div className="no-print bg-slate-50 px-5 py-3 border-t border-slate-200 flex items-center justify-between shrink-0">
-                <span className="text-xs text-slate-400">
-                  كشف رسمي جاهز للطباعة بحجم A4
+                <span className="text-xs text-slate-500">
+                  كشف رسمي ومنظم يقتصر على أسماء المجموعات وأفرادها فقط
                 </span>
                 <button
                   onClick={() => setPdfSubject(null)}

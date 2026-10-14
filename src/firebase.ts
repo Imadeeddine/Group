@@ -1,5 +1,11 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore } from 'firebase/firestore';
+import { 
+  initializeFirestore, 
+  persistentLocalCache, 
+  persistentMultipleTabManager, 
+  getFirestore,
+  Firestore
+} from 'firebase/firestore';
 import defaultConfig from '../firebase-applet-config.json';
 
 const config = {
@@ -14,9 +20,25 @@ const config = {
 
 const app = getApps().length === 0 ? initializeApp(config) : getApp();
 
-export const db = config.firestoreDatabaseId
-  ? getFirestore(app, config.firestoreDatabaseId)
-  : getFirestore(app);
+// Initialize Firestore with persistent multi-tab offline cache so writes appear instantly
+let firestoreDb: Firestore;
+try {
+  firestoreDb = initializeFirestore(
+    app,
+    {
+      localCache: persistentLocalCache({
+        tabManager: persistentMultipleTabManager()
+      })
+    },
+    config.firestoreDatabaseId || undefined
+  );
+} catch {
+  // If already initialized (e.g. HMR or existing instance), fallback to getFirestore
+  firestoreDb = config.firestoreDatabaseId
+    ? getFirestore(app, config.firestoreDatabaseId)
+    : getFirestore(app);
+}
 
+export const db = firestoreDb;
 export default app;
 
